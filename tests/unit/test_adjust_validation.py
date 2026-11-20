@@ -231,6 +231,7 @@ def test_two_actions_multiply_cumulatively():
     assert (adj.loc[5:11, "volume"] - 2000).abs().max() <= 1
     assert (adj.loc[12:, "volume"] == 1000).all()
 
+    
 def test_bonus_and_split_in_one_description_multiply():
     prices = synthetic_prices()
     ex = str(prices["date"][10].date())
