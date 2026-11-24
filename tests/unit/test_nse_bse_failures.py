@@ -18,10 +18,21 @@ class NetworkBlocked(BaseException):
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
+    # Clear shared NSE sessions so each test gets its own mocked session.
+    nse._NSE_SESSIONS.close()
+    bse._BSE_SESSIONS.close()
+
     def blocked(*args, **kwargs):
         raise NetworkBlocked("a test tried to use the network")
+
     monkeypatch.setattr(requests.sessions.Session, "request", blocked)
     monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    yield
+
+    # Prevent sessions created by this test from leaking into the next one.
+    nse._NSE_SESSIONS.close()
+    bse._BSE_SESSIONS.close()
 
 
 def dtypes_of(df):
@@ -160,10 +171,25 @@ class BseResponse:
 def use_bse(monkeypatch, handler):
     calls = []
 
-    def fake_get(url, headers=None, timeout=None):
-        calls.append(url)
-        return handler(url, len(calls))
-    monkeypatch.setattr(bse.requests, "get", fake_get)
+    class FakeBseSession:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, timeout=None):
+            calls.append(url)
+            return handler(url, len(calls))
+
+        def close(self):
+            pass
+
+    session = FakeBseSession()
+
+    monkeypatch.setattr(
+        bse,
+        "_create_bse_session",
+        lambda *args, **kwargs: session,
+    )
+
     return calls
 
 

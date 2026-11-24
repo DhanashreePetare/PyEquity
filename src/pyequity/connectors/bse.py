@@ -22,6 +22,9 @@ import requests
 from pyequity.connectors.symbol_map import get_bse_code
 from pyequity.schema import SCHEMAS, empty_frame
 from pyequity.reliability.outcome import FetchOutcome, Status
+from pyequity.reliability.rate_limiter import RateLimiter
+from pyequity.reliability.retry import retry_call
+from pyequity.reliability.session import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,22 @@ _HEADERS = {
     "sec-fetch-site":  "same-site",
 }
 
+def _create_bse_session(_key=None):
+    """Create a reusable BSE HTTP session."""
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+    return session
+
+
+_BSE_SESSIONS = SessionManager(
+    lambda key: _create_bse_session(key),
+    sleep=time.sleep,
+)
+
+_BSE_RATE_LIMITER = RateLimiter(
+    min_interval=1.0,
+    sleep=time.sleep,
+)
 
 def _clean_number(value):
     """BSE sends numbers as strings with thousands separators."""
@@ -50,75 +69,103 @@ def _clean_number(value):
     return value
 
 
-def _request_chunk(scripcode: str, from_date: str, to_date: str
-                   ) -> Tuple[pd.DataFrame, str]:
-    """
-    Internal: one request to BSE.
+def _request_chunk_once(
+    session: requests.Session,
+    scripcode: str,
+    from_date: str,
+    to_date: str,
+) -> pd.DataFrame:
+    """Perform one BSE HTTP request. Exceptions are handled by retry_call."""
+    fmt_from = datetime.strptime(from_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+    fmt_to = datetime.strptime(to_date, "%Y-%m-%d").strftime("%d/%m/%Y")
 
-    Args:
-        scripcode: BSE stock code, e.g. "500325".
-        from_date: YYYY-MM-DD.
-        to_date: YYYY-MM-DD.
+    url = (
+        "https://api.bseindia.com/BseIndiaAPI/api/StockpricesearchData/w"
+        f"?MonthDate={fmt_from}"
+        f"&YearDate={fmt_to}"
+        f"&pageType=0"
+        f"&Scode={scripcode}"
+        f"&Seg=C"
+        f"&rbType=D"
+        f"&SortOrder=true"
+    )
 
-    Returns:
-        (DataFrame, status). status is "ok", "empty" (BSE answered with no
-        rows) or "error" (the request or its parsing failed).
-    """
-    try:
-        fmt_from = datetime.strptime(from_date, "%Y-%m-%d").strftime("%d/%m/%Y")
-        fmt_to = datetime.strptime(to_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+    response = session.get(url, timeout=30)
 
-        url = (
-            f"https://api.bseindia.com/BseIndiaAPI/api/StockpricesearchData/w"
-            f"?MonthDate={fmt_from}"
-            f"&YearDate={fmt_to}"
-            f"&pageType=0"
-            f"&Scode={scripcode}"
-            f"&Seg=C"
-            f"&rbType=D"
-            f"&SortOrder=true"
+    if response.status_code != 200:
+        raise requests.HTTPError(
+            f"BSE returned HTTP {response.status_code} for {scripcode}",
+            response=response,
         )
 
-        response = requests.get(url, headers=_HEADERS, timeout=30)
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("BSE returned an invalid JSON payload")
 
-        if response.status_code != 200:
-            logger.error(f"[BSE] Error: status code {response.status_code} for {scripcode}")
-            return empty_frame("equity"), "error"
+    records = data.get("StockData")
+    if not records:
+        logger.warning("[BSE] No records found for scripcode %s", scripcode)
+        return empty_frame("equity")
 
-        data = response.json()
-        records = data.get("StockData")
+    df = pd.DataFrame(records)
+    df = df[
+        [
+            "RealDate", "qe_open", "qe_high", "qe_low", "qe_close",
+            "no_of_shrs", "no_trades",
+        ]
+    ].copy()
 
-        if not records:
-            logger.warning(f"[BSE] No records found for scripcode {scripcode}")
-            return empty_frame("equity"), "empty"
-
-        df = pd.DataFrame(records)
-        df = df[["RealDate", "qe_open", "qe_high", "qe_low", "qe_close",
-                 "no_of_shrs", "no_trades"]].copy()
-        df = df.rename(columns={
-            "RealDate":   "date",
-            "qe_open":    "open",
-            "qe_high":    "high",
-            "qe_low":     "low",
-            "qe_close":   "close",
+    df = df.rename(
+        columns={
+            "RealDate": "date",
+            "qe_open": "open",
+            "qe_high": "high",
+            "qe_low": "low",
+            "qe_close": "close",
             "no_of_shrs": "volume",
-            "no_trades":  "trades",
-        })
+            "no_trades": "trades",
+        }
+    )
 
-        df["date"] = pd.to_datetime(df["date"])
-        for col in ("open", "high", "low", "close"):
-            df[col] = df[col].apply(_clean_number).astype("float64")
-        for col in ("volume", "trades"):
-            df[col] = df[col].apply(_clean_number).astype("float64").astype("int64")
+    df["date"] = pd.to_datetime(df["date"])
 
-        df["symbol"] = data.get("scrip_id") or scripcode
-        df["source"] = "BSE"
-        df = df.sort_values("date").reset_index(drop=True)
+    for col in ("open", "high", "low", "close"):
+        df[col] = df[col].apply(_clean_number).astype("float64")
 
-        return df, "ok"
+    for col in ("volume", "trades"):
+        df[col] = (
+            df[col]
+            .apply(_clean_number)
+            .astype("float64")
+            .astype("int64")
+        )
 
-    except Exception as e:
-        logger.error(f"[BSE] Exception for {scripcode}: {e}")
+    df["symbol"] = data.get("scrip_id") or scripcode
+    df["source"] = "BSE"
+
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def _request_chunk(
+    scripcode: str,
+    from_date: str,
+    to_date: str,
+) -> Tuple[pd.DataFrame, str]:
+    """Compatibility helper: make one request without retrying."""
+    session_outcome = _BSE_SESSIONS.get("bse")
+
+    if not session_outcome.ok:
+        logger.error("[BSE] Session creation failed: %s", session_outcome.reason)
+        return empty_frame("equity"), "error"
+
+    try:
+        _BSE_RATE_LIMITER.wait("api.bseindia.com")
+        df = _request_chunk_once(
+            session_outcome.data, scripcode, from_date, to_date
+        )
+        return df, "empty" if df.empty else "ok"
+    except Exception as exc:
+        logger.error("[BSE] Request failed for %s: %s", scripcode, exc)
         return empty_frame("equity"), "error"
 
 
@@ -129,21 +176,40 @@ def _chunk_with_retry(
     *,
     return_attempts: bool = False,
 ) -> Tuple[pd.DataFrame, str] | Tuple[pd.DataFrame, str, int]:
-    """Retry real failures; optionally return the actual attempt count."""
-    attempts = 1
-    df, status = _request_chunk(scripcode, from_date, to_date)
+    """Fetch one chunk with shared retry and session management."""
+    session_outcome = _BSE_SESSIONS.get("bse")
 
-    for attempt in range(1, _ATTEMPTS):
-        if status != "error":
-            break
-        time.sleep(_RETRY_DELAY * attempt)
-        df, status = _request_chunk(scripcode, from_date, to_date)
-        attempts += 1
+    if not session_outcome.ok:
+        result = (empty_frame("equity"), "error", session_outcome.attempts)
+        return result if return_attempts else result[:2]
 
-    if return_attempts:
-        return df, status, attempts
+    session = session_outcome.data
 
-    return df, status
+    outcome = retry_call(
+        lambda: (
+            _BSE_RATE_LIMITER.wait("api.bseindia.com"),
+            _request_chunk_once(session, scripcode, from_date, to_date),
+        )[1],
+        max_attempts=_ATTEMPTS,
+        base_delay=_RETRY_DELAY,
+        label=f"BSE {scripcode} {from_date}..{to_date}",
+        is_empty=lambda df: df.empty,
+        sleep=time.sleep,
+    )
+
+    if outcome.ok:
+        result = (outcome.data, "ok", outcome.attempts)
+    elif outcome.empty:
+        result = (empty_frame("equity"), "empty", outcome.attempts)
+    else:
+        _BSE_SESSIONS.invalidate("bse")
+        logger.error(
+            "[BSE] Request failed for %s %s..%s: %s",
+            scripcode, from_date, to_date, outcome.reason,
+        )
+        result = (empty_frame("equity"), "error", outcome.attempts)
+
+    return result if return_attempts else result[:2]
 
 
 def _fetch_bse_chunk(scripcode: str, from_date: str, to_date: str) -> pd.DataFrame:
