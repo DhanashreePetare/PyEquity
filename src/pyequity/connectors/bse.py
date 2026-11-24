@@ -21,6 +21,7 @@ import requests
 
 from pyequity.connectors.symbol_map import get_bse_code
 from pyequity.schema import SCHEMAS, empty_frame
+from pyequity.reliability.outcome import FetchOutcome, Status
 
 logger = logging.getLogger(__name__)
 
@@ -121,15 +122,27 @@ def _request_chunk(scripcode: str, from_date: str, to_date: str
         return empty_frame("equity"), "error"
 
 
-def _chunk_with_retry(scripcode: str, from_date: str, to_date: str
-                      ) -> Tuple[pd.DataFrame, str]:
-    """Internal: retry real failures a few times; never retry an empty answer."""
+def _chunk_with_retry(
+    scripcode: str,
+    from_date: str,
+    to_date: str,
+    *,
+    return_attempts: bool = False,
+) -> Tuple[pd.DataFrame, str] | Tuple[pd.DataFrame, str, int]:
+    """Retry real failures; optionally return the actual attempt count."""
+    attempts = 1
     df, status = _request_chunk(scripcode, from_date, to_date)
+
     for attempt in range(1, _ATTEMPTS):
         if status != "error":
             break
         time.sleep(_RETRY_DELAY * attempt)
         df, status = _request_chunk(scripcode, from_date, to_date)
+        attempts += 1
+
+    if return_attempts:
+        return df, status, attempts
+
     return df, status
 
 
@@ -232,3 +245,97 @@ def fetch_bse_historical_by_symbol(symbol: str, from_date: str, to_date: str) ->
         logger.error(f"[BSE] {e}")
         return empty_frame("equity")
     return fetch_bse_historical(scripcode, from_date, to_date)
+
+
+def fetch_bse_historical_by_symbol_outcome(
+    symbol: str, from_date: str, to_date: str
+) -> FetchOutcome:
+    """Fetch BSE history by NSE symbol
+
+    Returns:
+        FetchOutcome containing the equity DataFrame, status, reason, and
+        actual request-attempt count.
+    """
+
+    try:
+        scripcode = get_bse_code(symbol)
+    except (ValueError, TypeError) as exc:
+        return FetchOutcome(Status.FAILED, reason=f"BSE mapping unavailable: {exc}")
+
+    try:
+        start = datetime.strptime(from_date, "%Y-%m-%d")
+        end = datetime.strptime(to_date, "%Y-%m-%d")
+    except (ValueError, TypeError) as exc:
+        return FetchOutcome(Status.FAILED, reason=f"Invalid dates: {exc}")
+
+    if start > end:
+        return FetchOutcome(Status.FAILED, reason="Start date is after end date")
+
+    chunks = []
+    saw_empty = False
+    attempts = 0
+    chunk_start = start
+
+    try:
+        while chunk_start <= end:
+            chunk_end = min(chunk_start + timedelta(days=_CHUNK_DAYS), end)
+            label = f"{chunk_start.date()}..{chunk_end.date()}"
+
+            df, status, chunk_attempts = _chunk_with_retry(
+                scripcode,
+                chunk_start.strftime("%Y-%m-%d"),
+                chunk_end.strftime("%Y-%m-%d"),
+                return_attempts=True,
+            )
+            attempts += chunk_attempts
+
+            if status == "error":
+                return FetchOutcome(
+                    Status.FAILED, reason=f"BSE request failed for {label}",
+                    attempts=attempts,
+                )
+
+            if len(df) >= BSE_ROW_CAP:
+                return FetchOutcome(
+                    Status.FAILED, reason=f"BSE row cap reached for {label}",
+                    attempts=attempts,
+                )
+
+            if status == "ok":
+                chunks.append(df)
+            else:
+                saw_empty = True
+
+            chunk_start = chunk_end + timedelta(days=1)
+            if chunk_start <= end:
+                time.sleep(_CHUNK_DELAY)
+
+    except Exception as exc:
+        return FetchOutcome(
+            Status.FAILED,
+            reason=f"BSE unexpected fetch error: {exc}",
+            attempts=attempts,
+        )
+
+    if not chunks:
+        return FetchOutcome(
+            Status.EMPTY if saw_empty else Status.FAILED,
+            empty_frame("equity"),
+            "" if saw_empty else "BSE returned no usable chunk result",
+            attempts,
+        )
+
+    try:
+        result = pd.concat(chunks, ignore_index=True)
+        result = result.drop_duplicates(subset=["date"])
+        result["symbol"] = str(symbol).strip().upper()
+        result["source"] = "BSE"
+        result = result.sort_values("date").reset_index(drop=True)
+        result = result[list(SCHEMAS["equity"])].astype(SCHEMAS["equity"])
+        return FetchOutcome(Status.OK, result, attempts=attempts)
+    except Exception as exc:
+        return FetchOutcome(
+            Status.FAILED,
+            reason=f"BSE response processing failed: {exc}",
+            attempts=attempts,
+        )

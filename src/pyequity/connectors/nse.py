@@ -20,6 +20,7 @@ import pandas as pd
 
 from pyequity.connectors._session_utils import create_nse_session
 from pyequity.schema import SCHEMAS, empty_frame
+from pyequity.reliability.outcome import FetchOutcome, Status
 
 logger = logging.getLogger(__name__)
 
@@ -97,15 +98,31 @@ def _request_chunk(session, symbol: str, from_date: str, to_date: str,
         return empty_frame("equity"), "error"
 
 
-def _chunk_with_retry(session, symbol: str, from_date: str, to_date: str,
-                      series: str) -> Tuple[pd.DataFrame, str]:
-    """Internal: retry real failures a few times; never retry an empty answer."""
+def _chunk_with_retry(
+    session,
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    series: str,
+    *,
+    return_attempts: bool = False,
+) -> Tuple[pd.DataFrame, str] | Tuple[pd.DataFrame, str, int]:
+    """Retry real failures; optionally return the actual attempt count."""
+    attempts = 1
     df, status = _request_chunk(session, symbol, from_date, to_date, series)
+
     for attempt in range(1, _ATTEMPTS):
         if status != "error":
             break
         time.sleep(_RETRY_DELAY * attempt)
-        df, status = _request_chunk(session, symbol, from_date, to_date, series)
+        df, status = _request_chunk(
+            session, symbol, from_date, to_date, series
+        )
+        attempts += 1
+
+    if return_attempts:
+        return df, status, attempts
+
     return df, status
 
 
@@ -204,3 +221,97 @@ def fetch_nse_historical(symbol: str, from_date: str, to_date: str,
 
     logger.info(f"[NSE] ✅ {symbol} — {len(df)} rows fetched")
     return df
+
+def fetch_nse_historical_outcome(
+    symbol: str, from_date: str, to_date: str, series: str = "EQ"
+) -> FetchOutcome:
+    """Fetch NSE history while preserving EMPTY versus FAILED outcomes.
+
+    Returns:
+        FetchOutcome containing the equity DataFrame, status, reason, and
+        actual request-attempt count.
+    """
+
+    try:
+        start = datetime.strptime(from_date, "%Y-%m-%d")
+        end = datetime.strptime(to_date, "%Y-%m-%d")
+    except (ValueError, TypeError) as exc:
+        return FetchOutcome(Status.FAILED, reason=f"Invalid dates: {exc}")
+
+    symbol = str(symbol).strip().upper() if symbol is not None else ""
+    if not symbol or start > end:
+        return FetchOutcome(Status.FAILED, reason="Invalid symbol or date range")
+
+    try:
+        session = create_nse_session(symbol)
+    except Exception as exc:
+        return FetchOutcome(Status.FAILED, reason=f"Session creation failed: {exc}")
+
+    chunks = []
+    saw_empty = False
+    attempts = 0
+    chunk_start = start
+
+    try:
+        while chunk_start <= end:
+            chunk_end = min(chunk_start + timedelta(days=_CHUNK_DAYS), end)
+            fmt_from = chunk_start.strftime("%d-%m-%Y")
+            fmt_to = chunk_end.strftime("%d-%m-%Y")
+
+            df, status, chunk_attempts = _chunk_with_retry(
+                session, symbol, fmt_from, fmt_to, series,
+                return_attempts=True,
+            )
+            attempts += chunk_attempts
+
+            if status == "error":
+                return FetchOutcome(
+                    Status.FAILED, reason=f"NSE request failed for {fmt_from}..{fmt_to}",
+                    attempts=attempts,
+                )
+
+            if len(df) >= NSE_ROW_CAP:
+                return FetchOutcome(
+                    Status.FAILED,
+                    reason=f"NSE row cap reached for {fmt_from}..{fmt_to}",
+                    attempts=attempts,
+                )
+
+            if status == "ok":
+                chunks.append(df)
+            else:
+                saw_empty = True
+
+            chunk_start = chunk_end + timedelta(days=1)
+            if chunk_start <= end:
+                time.sleep(_CHUNK_DELAY)
+
+    except Exception as exc:
+        return FetchOutcome(
+            Status.FAILED,
+            reason=f"NSE unexpected fetch error: {exc}",
+            attempts=attempts,
+        )
+
+    if not chunks:
+        return FetchOutcome(
+            Status.EMPTY if saw_empty else Status.FAILED,
+            empty_frame("equity"),
+            "" if saw_empty else "NSE returned no usable chunk result",
+            attempts,
+        )
+
+    try:
+        result = pd.concat(chunks, ignore_index=True)
+        result = result.drop_duplicates(subset=["date"])
+        result["symbol"] = symbol
+        result["source"] = "NSE"
+        result = result.sort_values("date").reset_index(drop=True)
+        result = result[list(SCHEMAS["equity"])].astype(SCHEMAS["equity"])
+        return FetchOutcome(Status.OK, result, attempts=attempts)
+    except Exception as exc:
+        return FetchOutcome(
+            Status.FAILED,
+            reason=f"NSE response processing failed: {exc}",
+            attempts=attempts,
+        )
