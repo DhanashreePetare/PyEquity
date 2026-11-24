@@ -18,7 +18,77 @@ from pyequity.connectors import bse as _bse
 from pyequity.processing.normalize import normalize, validate
 from pyequity.reliability.fallback import run_with_fallback
 from pyequity.schema import empty_frame
+from pyequity.reliability.cache import get_default_cache
+from pyequity.reliability.outcome import FetchOutcome, Status
 
+class _CachedFetchFailure(Exception):
+    """Preserve a failed connector outcome through the cache callback."""
+
+    def __init__(self, outcome: FetchOutcome):
+        self.outcome = outcome
+        super().__init__(outcome.reason)
+
+
+def _fetch_cached(
+    source: str,
+    symbol: str,
+    start: str,
+    end: str,
+    fetch,
+    *,
+    series: str | None = None,
+) -> FetchOutcome:
+    """Fetch complete equity history through the source-specific range cache."""
+    identity = {
+        "source": source,
+        "symbol": symbol,
+    }
+    if series is not None:
+        identity["series"] = series
+
+    def fetch_range(from_date: str, to_date: str) -> pd.DataFrame:
+        outcome = fetch(from_date, to_date)
+
+        if outcome.failed:
+            raise _CachedFetchFailure(outcome)
+
+        if outcome.empty:
+            return empty_frame("equity")
+
+        if not isinstance(outcome.data, pd.DataFrame) or outcome.data.empty:
+            raise _CachedFetchFailure(
+                FetchOutcome(
+                    Status.FAILED,
+                    reason=f"{source} returned an invalid or incomplete frame",
+                    attempts=outcome.attempts,
+                )
+            )
+
+        frame = outcome.data.copy()
+        frame["symbol"] = symbol
+        frame["source"] = source
+        return frame
+
+    try:
+        result = get_default_cache().get_series(
+            "equity",
+            identity,
+            start,
+            end,
+            fetch_range,
+        )
+    except _CachedFetchFailure as exc:
+        return exc.outcome
+    except Exception as exc:
+        return FetchOutcome(
+            Status.FAILED,
+            reason=f"{source} cache/fetch operation failed: {exc}",
+        )
+
+    if result.empty:
+        return FetchOutcome(Status.EMPTY, empty_frame("equity"))
+
+    return FetchOutcome(Status.OK, result)
 
 def get_history(
     symbol: str,
@@ -65,14 +135,29 @@ def get_history(
     if not isinstance(series, str) or not series.strip():
         raise InvalidArgumentError("series must be a non-empty string")
 
-    def fetch_nse():
-        return _nse.fetch_nse_historical_outcome(
-            sym, start_s, end_s, series.strip().upper()
+    nse_series = series.strip().upper()
+
+    def fetch_nse(from_date=start_s, to_date=end_s):
+        return _fetch_cached(
+            "NSE",
+            sym,
+            start_s,
+            end_s,
+            lambda a, b: _nse.fetch_nse_historical_outcome(
+                sym, a, b, nse_series
+            ),
+            series=nse_series,
         )
 
-    def fetch_bse():
-        return _bse.fetch_bse_historical_by_symbol_outcome(
-            sym, start_s, end_s
+    def fetch_bse(from_date=start_s, to_date=end_s):
+        return _fetch_cached(
+            "BSE",
+            sym,
+            start_s,
+            end_s,
+            lambda a, b: _bse.fetch_bse_historical_by_symbol_outcome(
+                sym, a, b
+            ),
         )
 
     if source == "nse":

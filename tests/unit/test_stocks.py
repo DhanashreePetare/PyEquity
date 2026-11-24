@@ -9,6 +9,12 @@ from pyequity.api._errors import (
     InvalidArgumentError,
 )
 from pyequity.reliability.outcome import FetchOutcome, Status
+from pyequity.reliability.cache import DiskCache
+
+@pytest.fixture(autouse=True)
+def isolated_cache(monkeypatch, tmp_path):
+    cache = DiskCache(directory=tmp_path)
+    monkeypatch.setattr(stocks, "get_default_cache", lambda: cache)
 
 
 @pytest.fixture
@@ -250,3 +256,75 @@ def test_nse_failure_bse_empty_preserves_fallback_metadata(monkeypatch):
     assert result.attrs["source"] == "BSE"
     assert result.attrs["fallback_used"] is True
     assert result.attrs["fallback_reason"] == "NSE unavailable"
+
+def test_nse_success_is_cached(monkeypatch, history_frame):
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        return success(history_frame)
+
+    monkeypatch.setattr(stocks._nse, "fetch_nse_historical_outcome", fetch)
+
+    first = stocks.get_history("RELIANCE", "2025-01-01", "2025-01-01")
+    second = stocks.get_history("RELIANCE", "2025-01-01", "2025-01-01")
+
+    assert len(first) == len(second) == 1
+    assert len(calls) == 1
+
+
+def test_nse_failed_fetch_is_not_cached(monkeypatch, history_frame):
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            return failure("temporary NSE failure")
+        return success(history_frame)
+
+    monkeypatch.setattr(stocks._nse, "fetch_nse_historical_outcome", fetch)
+
+    with pytest.raises(DataUnavailableError, match="temporary NSE failure"):
+        stocks.get_history(
+            "RELIANCE", "2025-01-01", "2025-01-01", source="nse"
+        )
+
+    result = stocks.get_history(
+        "RELIANCE", "2025-01-01", "2025-01-01", source="nse"
+    )
+
+    assert len(result) == 1
+    assert len(calls) == 2
+
+
+def test_nse_and_bse_cache_entries_are_separate(monkeypatch, history_frame):
+    nse_calls = []
+    bse_calls = []
+
+    bse_frame = history_frame.copy()
+    bse_frame["source"] = "BSE"
+
+    def fetch_nse(*args):
+        nse_calls.append(args)
+        return success(history_frame)
+
+    def fetch_bse(*args):
+        bse_calls.append(args)
+        return success(bse_frame)
+
+    monkeypatch.setattr(
+        stocks._nse, "fetch_nse_historical_outcome", fetch_nse
+    )
+    monkeypatch.setattr(
+        stocks._bse, "fetch_bse_historical_by_symbol_outcome", fetch_bse
+    )
+
+    stocks.get_history(
+        "RELIANCE", "2025-01-01", "2025-01-01", source="nse"
+    )
+    stocks.get_history(
+        "RELIANCE", "2025-01-01", "2025-01-01", source="bse"
+    )
+
+    assert len(nse_calls) == 1
+    assert len(bse_calls) == 1

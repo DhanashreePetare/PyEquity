@@ -17,10 +17,14 @@ from datetime import datetime, timedelta
 from typing import Tuple
 
 import pandas as pd
+import requests
 
 from pyequity.connectors._session_utils import create_nse_session
 from pyequity.schema import SCHEMAS, empty_frame
 from pyequity.reliability.outcome import FetchOutcome, Status
+from pyequity.reliability.session import SessionManager
+from pyequity.reliability.retry import retry_call
+from pyequity.reliability.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,16 @@ _ATTEMPTS = 3
 _RETRY_DELAY = 2.0   # seconds, multiplied by the attempt number
 _CHUNK_DELAY = 1.0   # seconds between chunks, to be gentle on NSE
 
+_NSE_SESSIONS = SessionManager(
+    lambda symbol: create_nse_session(symbol),
+    sleep=time.sleep,
+)
+
+_NSE_RATE_LIMITER = RateLimiter(
+    min_interval=1.0,
+    sleep=time.sleep,
+)
+
 _RENAME = {
     "mtimestamp":       "date",
     "chOpeningPrice":   "open",
@@ -40,6 +54,100 @@ _RENAME = {
     "chTotTradedQty":   "volume",
     "chTotalTrades":    "trades",
 }
+
+def _request_chunk_once(
+    session, symbol: str, from_date: str, to_date: str, series: str
+) -> pd.DataFrame:
+    """Perform one NSE request. Raise on transport, HTTP, or parsing failure."""
+    params = {
+        "functionName": "getHistoricalTradeData",
+        "symbol": symbol,
+        "series": series,
+        "fromDate": from_date,
+        "toDate": to_date,
+    }
+
+    response = session.get(_URL, params=params, timeout=15)
+
+    if response.status_code != 200:
+        raise requests.HTTPError(
+            f"NSE returned HTTP {response.status_code}",
+            response=response,
+        )
+
+    text = response.text.strip()
+    if not text or text in {"null", "[]"}:
+        return empty_frame("equity")
+
+    data = json.loads(text)
+    if not data:
+        return empty_frame("equity")
+
+    df = pd.DataFrame(data).rename(columns=_RENAME)
+    df = df[
+        ["date", "open", "high", "low", "close", "volume", "trades"]
+    ].copy()
+
+    df["date"] = pd.to_datetime(df["date"], format="%d-%b-%Y")
+
+    for col in ("open", "high", "low", "close"):
+        df[col] = df[col].astype("float64")
+
+    for col in ("volume", "trades"):
+        df[col] = df[col].astype("int64")
+
+    return df
+
+
+def _request_chunk(
+    session, symbol: str, from_date: str, to_date: str, series: str
+) -> Tuple[pd.DataFrame, str]:
+    """Compatibility wrapper retaining the original (DataFrame, status) result."""
+    try:
+        df = _request_chunk_once(session, symbol, from_date, to_date, series)
+        return df, "empty" if df.empty else "ok"
+    except Exception as exc:
+        logger.error(
+            "[NSE] Chunk fetch error for %s %s..%s: %s",
+            symbol, from_date, to_date, exc,
+        )
+        return empty_frame("equity"), "error"
+
+
+def _chunk_with_retry(
+    session,
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    series: str,
+    *,
+    return_attempts: bool = False,
+):
+    """Retry one chunk through the shared retry and rate-limit policies."""
+
+    outcome = retry_call(
+        lambda: (
+            _NSE_RATE_LIMITER.wait("www.nseindia.com"),
+            _request_chunk_once(session, symbol, from_date, to_date, series),
+        )[1],
+        max_attempts=_ATTEMPTS,
+        base_delay=_RETRY_DELAY,
+        label=f"NSE equity {symbol} {from_date}..{to_date}",
+        is_empty=lambda df: df.empty,
+        sleep=time.sleep,
+    )
+
+    if outcome.ok:
+        result = (outcome.data, "ok")
+    elif outcome.empty:
+        result = (empty_frame("equity"), "empty")
+    else:
+        result = (empty_frame("equity"), "error")
+
+    if return_attempts:
+        return (*result, outcome.attempts)
+
+    return result
 
 
 def _request_chunk(session, symbol: str, from_date: str, to_date: str,
@@ -136,101 +244,35 @@ def _fetch_nse_chunk(session, symbol, from_date, to_date, series="EQ"):
     return _request_chunk(session, symbol, from_date, to_date, series)[0]
 
 
-def fetch_nse_historical(symbol: str, from_date: str, to_date: str,
-                         series: str = "EQ") -> pd.DataFrame:
+def fetch_nse_historical(
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    series: str = "EQ",
+) -> pd.DataFrame:
     """
     Fetch historical OHLCV data for a stock from NSE.
 
-    Long ranges are split into chunks that stay under NSE's row cap. Failed
-    requests are retried. If a chunk still fails, or reaches the cap, an empty
-    frame is returned and an error is logged, so the result is never silently
-    incomplete.
-
-    Args:
-        symbol    : NSE stock symbol e.g. "RELIANCE", "TCS"
-        from_date : Start date in YYYY-MM-DD format e.g. "2025-09-23"
-        to_date   : End date   in YYYY-MM-DD format e.g. "2026-09-23"
-        series    : NSE series, default "EQ" (regular equity)
-
-    Returns:
-        pandas DataFrame in the standard equity schema:
-        date, open, high, low, close, volume, trades, symbol, source.
-        Sorted oldest to newest. Empty frame on any failure.
+    Returns a complete equity DataFrame or an empty schema frame.
+    Never returns partial data or raises an exception.
     """
-    try:
-        start = datetime.strptime(from_date, "%Y-%m-%d")
-        end = datetime.strptime(to_date, "%Y-%m-%d")
-    except (ValueError, TypeError):
-        logger.error("[NSE] Invalid date format. Use YYYY-MM-DD")
+    outcome = fetch_nse_historical_outcome(
+        symbol, from_date, to_date, series
+    )
+
+    if not outcome.ok:
+        logger.warning(
+            "[NSE] Historical fetch failed; refusing to return partial data: %s",
+            outcome.reason,
+        )
         return empty_frame("equity")
 
-    if start > end:
-        logger.error("[NSE] from_date cannot be after to_date")
-        return empty_frame("equity")
-
-    symbol = str(symbol).strip() if symbol is not None else ""
-    if not symbol:
-        logger.error("[NSE] symbol is required")
-        return empty_frame("equity")
-
-    logger.info(f"[NSE] Fetching {symbol} from {from_date} to {to_date}...")
-    try:
-        session = create_nse_session(symbol)
-    except Exception as e:
-        logger.error(f"[NSE] Could not create NSE session: {e}")
-        return empty_frame("equity")
-
-    chunks = []
-    chunk_start = start
-    while chunk_start <= end:
-        chunk_end = min(chunk_start + timedelta(days=_CHUNK_DAYS), end)
-        fmt_from = chunk_start.strftime("%d-%m-%Y")
-        fmt_to = chunk_end.strftime("%d-%m-%Y")
-
-        logger.info(f"[NSE] Fetching chunk: {fmt_from} to {fmt_to}...")
-        chunk_df, status = _chunk_with_retry(session, symbol, fmt_from, fmt_to, series)
-
-        if status == "error":
-            logger.error(f"[NSE] {symbol}: chunk {fmt_from} to {fmt_to} failed after "
-                         f"{_ATTEMPTS} attempts; returning no data instead of a partial result.")
-            return empty_frame("equity")
-
-        if len(chunk_df) >= NSE_ROW_CAP:
-            logger.error(f"[NSE] {symbol}: chunk {fmt_from} to {fmt_to} returned "
-                         f"{len(chunk_df)} rows, at NSE's {NSE_ROW_CAP}-row cap, so it may "
-                         f"be incomplete; returning no data.")
-            return empty_frame("equity")
-
-        if status == "ok":
-            chunks.append(chunk_df)
-
-        chunk_start = chunk_end + timedelta(days=1)
-        if chunk_start <= end:
-            time.sleep(_CHUNK_DELAY)
-
-    if not chunks:
-        logger.warning(f"[NSE] No data returned for {symbol}")
-        return empty_frame("equity")
-
-    df = pd.concat(chunks, ignore_index=True)
-    df = df.drop_duplicates(subset=["date"])
-    df["symbol"] = symbol.upper()
-    df["source"] = "NSE"
-    df = df.sort_values("date").reset_index(drop=True)
-    df = df[list(SCHEMAS["equity"])].astype(SCHEMAS["equity"])
-
-    logger.info(f"[NSE] ✅ {symbol} — {len(df)} rows fetched")
-    return df
+    return outcome.data
 
 def fetch_nse_historical_outcome(
     symbol: str, from_date: str, to_date: str, series: str = "EQ"
 ) -> FetchOutcome:
-    """Fetch NSE history while preserving EMPTY versus FAILED outcomes.
-
-    Returns:
-        FetchOutcome containing the equity DataFrame, status, reason, and
-        actual request-attempt count.
-    """
+    """Fetch complete NSE history while preserving EMPTY versus FAILED."""
 
     try:
         start = datetime.strptime(from_date, "%Y-%m-%d")
@@ -239,14 +281,20 @@ def fetch_nse_historical_outcome(
         return FetchOutcome(Status.FAILED, reason=f"Invalid dates: {exc}")
 
     symbol = str(symbol).strip().upper() if symbol is not None else ""
+
     if not symbol or start > end:
         return FetchOutcome(Status.FAILED, reason="Invalid symbol or date range")
 
-    try:
-        session = create_nse_session(symbol)
-    except Exception as exc:
-        return FetchOutcome(Status.FAILED, reason=f"Session creation failed: {exc}")
+    session_outcome = _NSE_SESSIONS.get(symbol)
 
+    if not session_outcome.ok:
+        return FetchOutcome(
+            Status.FAILED,
+            reason=f"NSE session creation failed: {session_outcome.reason}",
+            attempts=session_outcome.attempts,
+        )
+
+    session = session_outcome.data
     chunks = []
     saw_empty = False
     attempts = 0
@@ -259,14 +307,20 @@ def fetch_nse_historical_outcome(
             fmt_to = chunk_end.strftime("%d-%m-%Y")
 
             df, status, chunk_attempts = _chunk_with_retry(
-                session, symbol, fmt_from, fmt_to, series,
+                session,
+                symbol,
+                fmt_from,
+                fmt_to,
+                series,
                 return_attempts=True,
             )
             attempts += chunk_attempts
 
             if status == "error":
+                _NSE_SESSIONS.invalidate(symbol)
                 return FetchOutcome(
-                    Status.FAILED, reason=f"NSE request failed for {fmt_from}..{fmt_to}",
+                    Status.FAILED,
+                    reason=f"NSE request failed for {fmt_from}..{fmt_to}",
                     attempts=attempts,
                 )
 
@@ -283,10 +337,12 @@ def fetch_nse_historical_outcome(
                 saw_empty = True
 
             chunk_start = chunk_end + timedelta(days=1)
+
             if chunk_start <= end:
                 time.sleep(_CHUNK_DELAY)
 
     except Exception as exc:
+        _NSE_SESSIONS.invalidate(symbol)
         return FetchOutcome(
             Status.FAILED,
             reason=f"NSE unexpected fetch error: {exc}",
@@ -308,7 +364,9 @@ def fetch_nse_historical_outcome(
         result["source"] = "NSE"
         result = result.sort_values("date").reset_index(drop=True)
         result = result[list(SCHEMAS["equity"])].astype(SCHEMAS["equity"])
+
         return FetchOutcome(Status.OK, result, attempts=attempts)
+
     except Exception as exc:
         return FetchOutcome(
             Status.FAILED,

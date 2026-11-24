@@ -37,6 +37,7 @@ from pyequity.connectors.nse import fetch_nse_historical
 from pyequity.connectors.sebi import fetch_bulk_deals
 from pyequity.processing.normalize import normalize, validate
 from pyequity.schema import SCHEMAS, empty_frame
+from pyequity.connectors import bse as _bse
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -93,17 +94,29 @@ def _records(fixture: str) -> list:
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
     """No real HTTP and no real sleeping in any test in this file."""
+    _bse._BSE_SESSIONS.close()
+
     def blocked(*args, **kwargs):
         raise NetworkBlocked("a test tried to use the network")
 
     monkeypatch.setattr(requests.sessions.Session, "request", blocked)
     monkeypatch.setattr("time.sleep", lambda seconds: None)
 
+    yield
+
+    _bse._BSE_SESSIONS.close()
+
 
 def _use_session(mp, module: str, fixture: str) -> None:
     mp.setattr(f"pyequity.connectors.{module}.create_nse_session",
                lambda *a, **k: FakeSession(fixture))
 
+def _use_bse_session(mp, fixture: str) -> None:
+    mp.setattr(
+        _bse,
+        "_create_bse_session",
+        lambda *a, **k: FakeSession(fixture),
+    )
 
 def _use_requests(mp, fixture: str) -> None:
     body = _read(fixture)
@@ -120,7 +133,7 @@ def _run_nse(mp):
 
 
 def _run_bse(mp):
-    _use_requests(mp, "bse_reliance")
+    _use_bse_session(mp, "bse_reliance")
     return fetch_bse_historical("500325", "2026-09-15", "2026-09-23")
 
 
@@ -283,7 +296,7 @@ def _run_nse_invalid(mp):
 
 
 def _run_bse_invalid(mp):
-    _use_requests(mp, "bse_invalid_scripcode")
+    _use_bse_session(mp, "bse_invalid_scripcode")
     return fetch_bse_historical("999999", "2026-09-15", "2026-09-23")
 
 
