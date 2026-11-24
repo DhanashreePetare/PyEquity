@@ -29,6 +29,7 @@ from pandas.testing import assert_frame_equal
 
 from pyequity.connectors._action_parser import parse_action_detail
 from pyequity.processing.normalize import validate
+from pyequity.processing.adjust import compute_factors, adjust_prices
 from pyequity.schema import SCHEMAS, columns_of, empty_frame
 
 adjust = pytest.importorskip("pyequity.processing.adjust",
@@ -229,7 +230,7 @@ def test_two_actions_multiply_cumulatively():
     assert (adj.loc[:4, "volume"] - 4000).abs().max() <= 1
     assert (adj.loc[5:11, "volume"] - 2000).abs().max() <= 1
     assert (adj.loc[12:, "volume"] == 1000).all()
-    
+
 def test_bonus_and_split_in_one_description_multiply():
     prices = synthetic_prices()
     ex = str(prices["date"][10].date())
@@ -382,3 +383,40 @@ def test_inputs_are_never_modified():
     # Verify that the original inputs remain unchanged.
     assert_frame_equal(prices, prices_before)
     assert_frame_equal(actions, actions_before)
+
+def test_reverse_split_is_applied():
+    actions = pd.DataFrame(
+        [{
+            "ex_date": "2025-01-15",
+            "symbol": "TEST",
+            "action_categories": "SPLIT",
+            "parse_status": "ok",
+            "bonus_new": None,
+            "bonus_held": None,
+            "split_old_fv": 1,
+            "split_new_fv": 10,
+        }]
+    )
+
+    result = compute_factors(actions)
+
+    assert len(result) == 1
+    assert result.iloc[0]["factor"] == pytest.approx(10.0)
+    assert bool(result.iloc[0]["applied"]) is True
+
+def test_adjust_prices_rejects_volume_above_int64_max():
+    prices = pd.DataFrame(
+        [{
+            "date": "2025-01-01",
+            "open": 100.0,
+            "high": 105.0,
+            "low": 95.0,
+            "close": 102.0,
+            "volume": 2**63,
+            "symbol": "TEST",
+        }]
+    )
+
+    result = adjust_prices(prices, pd.DataFrame())
+
+    assert result.empty

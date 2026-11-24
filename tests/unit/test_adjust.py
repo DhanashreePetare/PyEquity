@@ -281,7 +281,7 @@ def test_p2_invalid_bonus_ratio_is_skipped_never_one(new, held):
     assert "invalid ratio" in out["reason"].iloc[0] and "skipped" in out["reason"].iloc[0]
 
 
-@pytest.mark.parametrize("old,new", [(1, 2), (1, 1), (0, 1), (2, 0), (-2, 1), (NAN, 1), (2, NAN)])
+@pytest.mark.parametrize("old,new", [(1, 1), (0, 1), (2, 0), (-2, 1), (NAN, 1), (2, NAN)])
 def test_p2_invalid_split_is_skipped_never_one(old, new):
     out = compute_factors(actions_df(act(cats="SPLIT", split=(old, new))))
     assert out["applied"].tolist() == [False]
@@ -289,7 +289,7 @@ def test_p2_invalid_split_is_skipped_never_one(old, new):
 
 
 def test_p2_valid_part_survives_next_to_an_invalid_part():
-    row = act(cats="BONUS|SPLIT", bonus=(1, 1), split=(1, 2))
+    row = act(cats="BONUS|SPLIT", bonus=(1, 1), split=(0, 1))
     out = compute_factors(actions_df(row))
     assert out["factor"].tolist() == [0.5] and out["applied"].tolist() == [True]
     assert "skipped: SPLIT" in out["reason"].iloc[0]

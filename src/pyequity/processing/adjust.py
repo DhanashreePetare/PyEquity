@@ -196,7 +196,7 @@ def _evaluate_row(row: Dict[str, Any]) -> Tuple[Fraction, List[str], List[str], 
             factor *= part
         elif category == "SPLIT":
             old, new = _number(row.get("split_old_fv")), _number(row.get("split_new_fv"))
-            if old is None or new is None or old <= 0 or new <= 0 or old <= new:
+            if old is None or new is None or old <= 0 or new <= 0 or old == new:
                 skipped.append(f"SPLIT (invalid face values {row.get('split_old_fv')!r} -> "
                                f"{row.get('split_new_fv')!r})")
                 continue
@@ -446,8 +446,12 @@ def adjust_prices(prices: pd.DataFrame, actions: pd.DataFrame) -> pd.DataFrame:
         not np.isfinite(volume_f).all()
         or (volume_f != np.floor(volume_f)).any()
         or (volume_f < 0).any()
+        or (volume_f >= 2**63).any()
     ):
-        return _fail("prices volume must be non-negative whole numbers without missing values")
+        return _fail(
+            "prices volume must be non-negative whole numbers within the int64 range "
+            "without missing values"
+        )
     volume_in = prices["volume"].astype("int64").to_numpy()
     trades_in = None
     if "trades" in prices.columns:
