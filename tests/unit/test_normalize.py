@@ -456,3 +456,31 @@ def test_validate_works_on_raw_unnormalized_frame():
 def test_normalize_then_validate_clean_for_every_dataset():
     for dataset in ALL:
         assert validate(normalize(make(dataset).iloc[::-1], dataset), dataset).ok
+
+
+
+# ---------------------------------------------------------------------------
+# Edge cases: unparseable dates, duplicate column names in validate()
+# ---------------------------------------------------------------------------
+
+def test_unparseable_date_becomes_nat_with_a_warning_and_the_row_is_kept(caplog):
+    df = make("equity")
+    df["date"] = ["2026-09-01", "not a date", "2026-09-03"]
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        out = normalize(df, "equity")
+    assert len(out) == 3                                   # never dropped for bad values
+    assert str(out["date"].dtype) == "datetime64[ns]"
+    assert out["date"].isna().sum() == 1
+    assert out["date"].iloc[-1] is pd.NaT                  # undated rows sort last
+    assert out["close"].tolist() == [104.0, 106.0, 105.0]  # the bad-date row moved, its data did not change
+    assert any("could not be parsed as dates" in r.getMessage() and "equity.date" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_validate_reports_duplicate_column_names_as_an_error(caplog):
+    df = pd.concat([make("equity"), make("equity")[["close"]]], axis=1)
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        report = validate(df, "equity")
+    assert not report.ok and report.has("duplicate_columns")
+    assert [i.code for i in report.issues] == ["duplicate_columns"]   # stops there, no confusing follow-ups
+    assert any("duplicate_columns" in r.getMessage() for r in caplog.records)

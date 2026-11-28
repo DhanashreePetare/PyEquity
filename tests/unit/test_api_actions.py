@@ -15,8 +15,8 @@ import pytest
 
 from pyequity.api import actions as api
 from pyequity.api._errors import (
-    DataUnavailableError, EmptyResultWarning, IncompleteDataWarning,
-    InvalidArgumentError)
+    DataQualityWarning, DataUnavailableError, EmptyResultWarning,
+    IncompleteDataWarning, InvalidArgumentError)
 from pyequity.connectors import corporate as connector
 from pyequity.processing.normalize import normalize
 from pyequity.reliability import cache as cache_mod
@@ -552,3 +552,14 @@ def test_connector_wrapper_is_unchanged_by_the_api_layer(real_connector):
     real_connector(NseSession([], status=500))
     assert connector.fetch_corporate_actions("RELIANCE").empty
     assert connector.fetch_corporate_actions_outcome("RELIANCE").failed
+
+
+def test_integrity_errors_are_warned_and_rows_are_kept(monkeypatch):
+    # A connector that ignores the requested window returns rows before ``start``;
+    # validation reports them as outside the range instead of dropping them.
+    universe = actions_frame(RELIANCE)
+    install(monkeypatch, lambda call: FetchOutcome(Status.OK, universe.copy()))
+    with pytest.warns(DataQualityWarning, match="integrity"):
+        df = api.get_actions("RELIANCE", start="2024-01-01")
+    assert len(df) == len(RELIANCE)  # reported, never silently dropped
+    assert (df["ex_date"] < pd.Timestamp("2024-01-01")).sum() == 3

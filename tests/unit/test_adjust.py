@@ -1004,3 +1004,57 @@ def test_negative_volume_fails_safe(caplog):
     assert out.empty
     assert list(out.columns) == list(SCHEMAS["equity"])
     assert messages(caplog, logging.ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Edge cases: timezone-aware dates and volume/trades that cannot convert exactly
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("zone", ["Asia/Kolkata", "America/New_York"])
+def test_timezone_aware_ex_dates_give_the_same_result_as_naive_ones(zone):
+    # Tuesday ex-date; Monday is a trading day. Midnight in New York is 04:00-05:00
+    # UTC on the SAME day, so an ex-date left timezone-aware and read as UTC would
+    # land after the ex-date row's own midnight and misplace that row. Kolkata
+    # (ahead of UTC) shifts it the other way. Neither may change the result.
+    px = raw_prices("2024-10-21", "2024-11-01", events=[("2024-10-29", 0.5)])
+    naive = actions_df(bonus(1, 1, ex="2024-10-29"))
+    aware = naive.copy()
+    aware["ex_date"] = aware["ex_date"].dt.tz_localize(zone)
+    assert aware["ex_date"].dt.tz is not None
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                # e.g. numpy's "no representation of timezones"
+        out = adjust_prices(px, aware)
+    pd.testing.assert_frame_equal(out, adjust_prices(px, naive))
+    assert np.allclose(out["close"], 50.0)           # continuous across the ex-date
+    assert out.loc[out["date"] == "2024-10-28", "close"].iloc[0] == 50.0   # Monday is pre-ex
+    assert out.loc[out["date"] == "2024-10-29", "close"].iloc[0] == 50.0   # ex-date row is not
+    assert (out["volume"] == 2000).all()
+
+
+def test_timezone_aware_price_dates_are_adjusted_and_returned_naive():
+    px = raw_prices("2024-10-21", "2024-11-01", events=[("2024-10-28", 0.5)])
+    aware = px.copy()
+    aware["date"] = aware["date"].dt.tz_localize("Asia/Kolkata")
+    actions = actions_df(bonus(1, 1, ex="2024-10-28"))
+    out = adjust_prices(aware, actions)
+    assert str(out["date"].dtype) == "datetime64[ns]"          # no timezone left
+    assert out["date"].tolist() == px["date"].tolist()         # same calendar days
+    assert np.allclose(out["close"], 50.0)
+    pd.testing.assert_frame_equal(out, adjust_prices(px, actions))
+
+
+@pytest.mark.parametrize("column,value,expected", [
+    ("volume", 1000.5, "whole numbers"),                 # fractional volume
+    ("volume", float(2 ** 63), "int64 range"),           # oversized volume
+    ("trades", 1.5, "whole numbers"),                    # fractional trades
+    ("trades", float(2 ** 54), "too large"),             # trades beyond exact float range
+])
+def test_fractional_or_oversized_volume_and_trades_fail_safe(caplog, column, value, expected):
+    px = raw_prices("2024-10-21", "2024-11-01")
+    px[column] = px[column].astype("float64")
+    px.loc[2, column] = value
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        out = adjust_prices(px, actions_df(bonus(1, 1)))
+    assert out.empty and list(out.columns) == list(SCHEMAS["equity"])   # never raw data as adjusted
+    assert any(expected in m for m in messages(caplog, logging.ERROR)), (
+        column, messages(caplog, logging.ERROR))

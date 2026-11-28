@@ -255,3 +255,31 @@ def test_numbers_exist_exactly_when_the_category_is_present_and_ok():
             assert (not math.isnan(r["bonus_new"])) == ("BONUS" in cats), text
             assert (not math.isnan(r["split_old_fv"])) == ("SPLIT" in cats), text
             assert (not math.isnan(r["rights_new"])) == ("RIGHTS" in cats), text
+
+
+# ---------------------------------------------------------------------------
+# Gating: text that cannot be read exactly is flagged, never turned into numbers
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "Face Value Split - Rs 10 to Rs 1",                      # no "From"
+    "Split Of Shares",                                       # no face values at all
+    "Face Value Split (Sub-Division) - From Rs 10/- To",     # cut off
+])
+def test_split_that_does_not_parse_needs_review_and_has_no_numbers(text):
+    r = parse(text)
+    assert r["action_categories"] == "SPLIT", text
+    assert r["parse_status"] == "needs_review", text
+    assert math.isnan(r["split_old_fv"]) and math.isnan(r["split_new_fv"]), text
+
+
+@pytest.mark.parametrize("text", [
+    "Rights 0:15 @ Premium Rs 1247",
+    "Rights 1:0 @ Premium Rs 100",
+])
+def test_implausible_rights_ratio_needs_review(text):
+    r = parse(text)
+    assert r["action_categories"] == "RIGHTS", text
+    assert r["parse_status"] == "needs_review", text
+    # the plausible neighbour of the same shape is accepted, so the ratio is what flags it
+    assert parse("Rights 1:15 @ Premium Rs 1247")["parse_status"] == "ok"

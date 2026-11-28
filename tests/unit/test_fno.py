@@ -584,3 +584,49 @@ def test_outcome_failed_when_processing_raises_after_the_fetch(monkeypatch, capl
     assert "post-processing exploded" in outcome.reason
     assert legacy.empty and list(legacy.columns) == columns_of("fno")
     assert any("post-processing exploded" in r.message for r in caplog.records)
+
+# ---------- edge cases: response wrapper, bad `data`, split-range failures ----------
+
+def test_outcome_accepts_a_data_wrapper_around_the_rows(monkeypatch):
+    class Wrapped(FakeSession):
+        def get(self, url, params=None, timeout=None):
+            resp = super().get(url, params, timeout)
+            return FakeResponse({"data": resp.json()}, resp.status_code)
+
+    universe = futures_universe(10)  # 3 expiries per day
+    install(monkeypatch, Wrapped(universe))
+    outcome = fno.fetch_fno_outcome("RELIANCE", "2026-01-01", "2026-01-31")
+    assert outcome.status is Status.OK
+    assert len(outcome.data) == len(universe) == 30
+    assert list(outcome.data.columns) == columns_of("fno")
+
+
+@pytest.mark.parametrize("payload", [{"data": "oops"}, {"data": {"rows": []}},
+                                     {"data": None}],
+                         ids=["string", "object", "null"])
+def test_outcome_failed_when_data_is_not_a_list(monkeypatch, payload):
+    class BadData(FakeSession):
+        def get(self, url, params=None, timeout=None):
+            return FakeResponse(payload)
+
+    install(monkeypatch, BadData())
+    outcome = fno.fetch_fno_outcome("RELIANCE", "2026-01-01", "2026-01-31")
+    assert outcome.failed and outcome.data is None
+    assert fno.fetch_fno_data("RELIANCE", "2026-01-01", "2026-01-31").empty
+
+
+@pytest.mark.parametrize("failing_call,half", [(2, "first"), (3, "second")])
+def test_outcome_failed_when_one_half_of_a_split_range_fails(monkeypatch, failing_call, half):
+    # 6 expiries per day: the first 20-day chunk (call 1) reaches the row cap and
+    # is split in two; call 2 is the first half, call 3 the second half.
+    expiries = [datetime(2026, 11, 24) + timedelta(days=30 * i) for i in range(6)]
+    universe = [make_row(d, e) for d in weekdays(datetime(2026, 1, 1), 40) for e in expiries]
+    session = install(monkeypatch, FakeSession(universe, fail_on_call=failing_call))
+    outcome = fno.fetch_fno_outcome("RELIANCE", "2026-01-01", "2026-01-21")
+    assert outcome.failed, half
+    assert outcome.data is None                      # never the half that did succeed
+    assert "request failed" in outcome.reason
+    assert len(session.calls) == failing_call        # stopped there, no retry
+
+    install(monkeypatch, FakeSession(universe, fail_on_call=failing_call))
+    assert fno.fetch_fno_data("RELIANCE", "2026-01-01", "2026-01-21").empty

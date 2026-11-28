@@ -12,8 +12,8 @@ import pytest
 
 from pyequity.api import fno as api
 from pyequity.api._errors import (
-    DataUnavailableError, EmptyResultWarning, IncompleteDataWarning,
-    InvalidArgumentError)
+    DataQualityWarning, DataUnavailableError, EmptyResultWarning,
+    IncompleteDataWarning, InvalidArgumentError)
 from pyequity.connectors import fno as connector
 from pyequity.processing.normalize import normalize
 from pyequity.reliability import cache as cache_mod
@@ -575,3 +575,13 @@ def test_connector_wrappers_are_unchanged_by_the_api_layer(real_connector):
     real_connector(NseSession([], status=500))
     assert connector.fetch_fno_data("RELIANCE", "2026-01-01", "2026-01-30").empty
     assert connector.fetch_fno_outcome("RELIANCE", "2026-01-01", "2026-01-30").failed
+
+
+def test_integrity_errors_are_warned_and_rows_are_kept(monkeypatch):
+    universe = fno_frame(JAN)
+    universe.loc[3, "high"] = 5.0  # high < low: a validation error
+    install(monkeypatch, serving(universe))
+    with pytest.warns(DataQualityWarning, match="integrity"):
+        df = api.get_history("RELIANCE", "2026-01-01", "2026-01-30")
+    assert len(df) == len(JAN)  # reported, never silently dropped
+    assert (df["high"] < df["low"]).sum() == 1
